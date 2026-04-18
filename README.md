@@ -113,7 +113,15 @@ OUTPUT_FILE=result.csv
 
 ---
 
-## 📥 Формат вхідних даних
+## Створення токена GitHub Models
+Перейдіть на сторінку **GitHub Models**
+Зі списку моделей оберіть **OpenAI GPT-4o mini**
+Натисніть **Use this model**
+Оберіть **Create personal access token**, згенеруйте токен і скопіюйте його
+
+---
+
+## Формат вхідних даних
 
 Файл `products.txt`:
 
