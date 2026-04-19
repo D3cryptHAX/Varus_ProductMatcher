@@ -1,44 +1,35 @@
 import os
 import csv
-import math
 import json
 import logging
+import time
 from typing import Optional
 from dotenv import load_dotenv
 import httpx
-from bs4 import BeautifulSoup
 from openai import OpenAI
 from pydantic import BaseModel
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()]
-)
+# Логування
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+
+# Конфігурація
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 INPUT_FILE = os.getenv("INPUT_FILE", "products.txt")
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "result.csv")
 
-if not GITHUB_TOKEN:
-    logger.error("Не знайдено GITHUB_TOKEN у файлі .env")
+if not GITHUB_TOKEN or not SERPAPI_KEY:
+    logger.error("Відсутні ключі (GITHUB_TOKEN або SERPAPI_KEY) у файлі .env")
     exit(1)
 
+# Клієнт для GitHub Models
 client = OpenAI(
     base_url="https://models.inference.ai.azure.com",
     api_key=GITHUB_TOKEN
 )
-
-MODEL_NAME = "gpt-4o-mini"
-
-
-class ParsedProduct(BaseModel):
-    original_text: str
-    name: str
-    quantity: float
-    unit: str
 
 
 class VarusItem(BaseModel):
@@ -51,118 +42,97 @@ class MatchResult(BaseModel):
     best_match_title: Optional[str] = None
     best_match_url: Optional[str] = None
     item_capacity: Optional[float] = None
-    explanation: Optional[str] = None
 
 
-class ProductParser:
-    """Нормалізація через GitHub Models."""
+class SerpApiVarusSearcher:
+    """Використовує SerpApi для отримання результатів пошуку Google."""
 
     @staticmethod
-    def parse_line(line: str) -> Optional[ParsedProduct]:
-        prompt = f"Розпарси рядок продукту: '{line}'. Поверни JSON (name, quantity, unit: шт/гр/кг)."
+    def search(query: str) -> list[VarusItem]:
+        search_query = f"site:varus.ua {query}"
+
+        url = "https://serpapi.com/search"
+        params = {
+            "engine": "google",
+            "q": search_query,
+            "google_domain": "google.com.ua",
+            "gl": "ua",
+            "hl": "uk",
+            "api_key": SERPAPI_KEY
+        }
+
         try:
-            response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": "Ти — парсер даних. Відповідай суворо в JSON."},
-                    {"role": "user", "content": prompt}
-                ],
-                response_format={"type": "json_object"}
-            )
-            data = json.loads(response.choices[0].message.content)
-            return ParsedProduct(
-                original_text=line,
-                name=data.get("name"),
-                quantity=float(data.get("quantity", 0)),
-                unit=data.get("unit")
-            )
-        except Exception as e:
-            logger.error(f"Помилка парсингу: {e}")
-            return None
+            with httpx.Client() as h_client:
+                resp = h_client.get(url, params=params, timeout=15.0)
 
-
-class VarusScraper:
-    """Пошук на сайті. Модель допоможе уточнити запит."""
-    BASE_URL = "https://varus.ua"
-    SEARCH_URL = "https://varus.ua/uk/search"
-
-    @classmethod
-    def search_products(cls, query: str, limit: int = 5) -> list[VarusItem]:
-        try:
-            # Спроба базового URL без префікса мови, якщо той видає 404
-            url = "https://varus.ua/search/"
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7"
-            }
-            params = {"q": query}
-            response = httpx.get(url, params=params, headers=headers, timeout=10.0, follow_redirects=True)
-
-            if response.status_code != 200:
-                logger.warning(f"Сайт повернув {response.status_code}. AI використає власну базу.")
+            if resp.status_code != 200:
+                logger.error(f"SerpApi Error: {resp.status_code}")
                 return []
 
-            soup = BeautifulSoup(response.text, "html.parser")
+            data = resp.json()
             items = []
-            # Селектори
-            cards = soup.select(".sf-product-card") or soup.select("article")
+            results = data.get("organic_results", [])
 
-            for card in cards[:limit]:
-                title_elem = card.select_one(".sf-product-card__title") or card.select_one("h3")
-                link_elem = card.select_one("a")
+            for result in results:
+                link = result.get("link").split("?")[0]
+                title = result.get("title", "").replace(" - Varus", "").replace(" | Varus", "").strip()
 
-                if title_elem and link_elem:
-                    href = link_elem.get("href", "")
-                    items.append(VarusItem(
-                        title=title_elem.get_text(strip=True),
-                        url=cls.BASE_URL + href if href.startswith("/") else href
-                    ))
+                if link and "varus.ua" in link and "/search/" not in link:
+                    items.append(VarusItem(title=title, url=link))
+
             return items
         except Exception as e:
-            logger.error(f"Помилка скрейпінгу: {e}")
+            logger.error(f"Помилка SerpApi: {e}")
             return []
 
 
 class AIProductMatcher:
-    """Вибір релевантного товару за допомогою Search-можливостей моделі."""
-
     @staticmethod
-    def match_and_analyze(requirement: ParsedProduct, found_items: list[VarusItem]) -> Optional[MatchResult]:
-        items_str = "\n".join([f"- {i}. {it.title} ({it.url})" for i, it in enumerate(found_items)])
+    def match(requirement: str, found_items: list[VarusItem]) -> Optional[MatchResult]:
+        if not found_items:
+            return MatchResult(is_found=False)
 
-        # Просимо модель використати її знання (Search) для аналізу упаковок
+        items_str = "\n".join([f"- Назва: {it.title} | Посилання: {it.url}" for it in found_items])
+
         prompt = f"""
-        Потреба: {requirement.name}, {requirement.quantity} {requirement.unit}.
-        Знайдені позиції на Varus:
-        {items_str if found_items else "Нічого не знайдено в списку."}
+        Запит користувача: {requirement}
+        Доступні товари на Varus:
+        {items_str}
 
         Твоє завдання:
-        1. Вибери найбільш підходящий товар.
-        2. Використай свої знання про товари Varus (якщо список порожній, спробуй запропонувати посилання самостійно).
-        3. Визнач pack_capacity (вага/кількість в одній одиниці товару) в одиницях: {requirement.unit}.
+        1. Пріоритет: Якщо користувач шукає базовий продукт (банани, полуниця), обирай свіжий товар (ваговий), а не в'ялений, сушений чи заморожений.
+        2. Суворість: Якщо жоден товар не відповідає суті запиту (наприклад, замість м'яса пропонують приправу), поверни is_found: false.
+        3. Очищення: У полі 'best_match_title' пиши чисту назву без зайвих слів 'купити онлайн', 'замовити в супермаркеті'.
 
-        Поверни JSON: is_found (bool), best_match_title, best_match_url, item_capacity (float).
+        Відповідай ТІЛЬКИ JSON:
+        {{
+            "is_found": bool,
+            "best_match_title": "Назва товару",
+            "best_match_url": "URL",
+            "item_capacity": float
+        }}
         """
         try:
             response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": "Ти експерт із закупівель Varus. Відповідай у JSON."},
-                    {"role": "user", "content": prompt}
-                ],
-                response_format={"type": "json_object"}
+                model="gpt-4o-mini",
+                messages=[{"role": "system",
+                           "content": "Ти помічник закупника Varus. Завжди намагайся знайти відповідність."},
+                          {"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0
             )
-            data = json.loads(response.choices[0].message.content)
-            return MatchResult(**data)
+            content = response.choices[0].message.content
+            data = json.loads(content)
+
+            return MatchResult(
+                is_found=data.get("is_found", False),
+                best_match_title=data.get("best_match_title"),
+                best_match_url=data.get("best_match_url"),
+                item_capacity=data.get("item_capacity")
+            )
         except Exception as e:
             logger.error(f"Помилка матчингу: {e}")
-            return None
-
-
-def calculate_optimal_quantity(required: float, item_capacity: float) -> int:
-    if not item_capacity or item_capacity <= 0: return 1
-    return math.ceil(required / item_capacity)
+            return MatchResult(is_found=False)
 
 
 def main():
@@ -170,39 +140,38 @@ def main():
         logger.error(f"Файл {INPUT_FILE} не знайдено!")
         return
 
-    results = []
     with open(INPUT_FILE, "r", encoding="utf-8") as f:
         lines = [line.strip() for line in f if line.strip()]
 
+    results = []
     for line in lines:
-        logger.info(f"Обробка: {line}")
-        parsed = ProductParser.parse_line(line)
-        if not parsed: continue
+        logger.info(f"--- Обробка: {line} ---")
 
-        # Пошук
-        search_results = VarusScraper.search_products(parsed.name)
+        # Пошук (тільки назва до коми)
+        search_query = line.split(',')[0].strip()
+        found_items = SerpApiVarusSearcher.search(search_query)
 
-        # Аналіз через AI
-        match = AIProductMatcher.match_and_analyze(parsed, search_results)
+        # AI матчінг
+        match = AIProductMatcher.match(line, found_items)
 
-        if match and match.is_found:
-            qty = calculate_optimal_quantity(parsed.quantity, match.item_capacity)
+        if match and match.is_found and match.best_match_title:
             results.append({
                 "Продукт": line,
                 "Товар": match.best_match_title,
-                "Кількість": qty,
                 "Посилання": match.best_match_url
             })
-            logger.info(f"Результат: {match.best_match_title} x {qty}")
+            logger.info(f"Успішно знайдено: {match.best_match_title}")
         else:
-            results.append({"Продукт": line, "Товар": "Не знайдено", "Кількість": "-", "Посилання": "-"})
+            results.append({"Продукт": line, "Товар": "Не знайдено", "Посилання": "-"})
+            logger.warning(f"Товар для '{line}' не підібрано.")
 
-    # CSV
+        time.sleep(0.5)
+
     with open(OUTPUT_FILE, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["Продукт", "Товар", "Кількість", "Посилання"])
+        writer = csv.DictWriter(f, fieldnames=["Продукт", "Товар", "Посилання"])
         writer.writeheader()
         writer.writerows(results)
-    logger.info("Файл результатів сформовано.")
+    logger.info(f"Готово! Результати в {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
